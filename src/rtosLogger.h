@@ -1,59 +1,87 @@
-// rtosLogger: printf style logging that costs the caller a queue send.
+// rtosLogger: printf style logging that costs the caller a few stores.
 //
 //   logI("rpm=%d temp=%.2f", rpm, temp);   ->   [I] rpm=1200 temp=31.50
 //
-// The caller copies the raw arguments into a record and leaves. A low priority task reads them
-// back as the same types and calls the real snprintf later, so every specifier works and no
-// float formatting runs at the call. The format must be a literal; a %s is copied at the call.
+// The caller writes the raw arguments into a ring of its own core and leaves. A low priority task
+// reads them back as the same types and calls the real snprintf later, so every specifier works and
+// no float formatting runs at the call. The format must be a literal; a %s is copied at the call.
 // C++11 only: the nRF52 core compiles at gnu++11.
 #pragma once
 #include <Arduino.h>
 #include <atomic>
 
+#ifndef LOG_RING
+#define LOG_RING 4096  // build flag: bytes of ring per core, the .cpp sizes it
+#endif
 #ifndef LOG_BODY
-#define LOG_BODY 500  // build flag, the .cpp sizes the queue by it. 512 byte record with the header
+#define LOG_BODY 500  // the longest %s kept, in bytes
+#endif
+#if defined(ARDUINO_ARCH_ESP32)
+#define LOG_CORES portNUM_PROCESSORS
+#else
+#define LOG_CORES 1
 #endif
 
-#define LOG_INLINE inline __attribute__((always_inline))  // a call out to flash measured 3 us
+#define LOG_INLINE inline __attribute__((always_inline))  // a call out to flash is a cache miss
 
-struct LogRec {
-  const char *fmt;                                // a literal, level included
-  int (*format)(const LogRec &, char *, size_t);  // picked per call site by the compiler
-  uint16_t len;                                   // body in use, or OVER
-  uint8_t body[LOG_BODY];
-  static const uint16_t OVER = 0xFFFF;
+// One per core, so no two cores share one. Its writers take turns by masking their own core's
+// interrupts, its one reader is the log task. Word indices, and a record never wraps
+struct LogRing {
+  std::atomic<uint32_t> w, r;
+  uint32_t drops, end, ps;  // lines refused; the record being written, and the mask to give back
+  uint32_t buf[LOG_RING / 4];
 };
+// the size in the name: a sketch that defines LOG_RING differently from the .cpp fails to link
+#define LOG_CAT2(a, b) a##b
+#define LOG_CAT(a, b) LOG_CAT2(a, b)
+#define logRings LOG_CAT(logRings, LOG_RING)
+extern LogRing logRings[LOG_CORES];
 
-// one pair per type: how the caller stores it, how the task reads it back
+// in rtosLogger.cpp, in IRAM: the part every call site shares, so it is never a cache miss
+typedef int (*LogFormat)(const uint32_t *args, const char *fmt, char *out, size_t cap);
+uint32_t *logOpen(const char *fmt, LogFormat format, uint32_t words);  // nullptr: full, counted
+void logClose();
+extern std::atomic<uint32_t> logDrops;  // lines refused, or never taken by the cable
+
+// where the lines go, Serial until then: logTo([](const char *text, size_t n) { ... }). text holds
+// several lines, each ending in a newline
+typedef void (*LogOut)(const char *text, size_t n);
+void logTo(LogOut out);
+
+// one per type: its size in bytes, how the caller stores it, how the task reads it back
 template <class T>
 struct LogArg {
-  static LOG_INLINE void put(LogRec &r, T v) {
-    if (r.len > sizeof r.body - sizeof v) return (void)(r.len = LogRec::OVER);
-    const uint8_t *b = (const uint8_t *)&v;
-    for (size_t i = 0; i < sizeof v; i++) r.body[r.len + i] = b[i];  // memcpy is a ROM call
-    r.len += sizeof v;
+  static const uint32_t W = (sizeof(T) + 3) / 4;
+  static LOG_INLINE uint32_t bytes(T) { return W * 4; }
+  static LOG_INLINE uint32_t *put(uint32_t *p, T v, uint32_t) {
+    // through a word array: straight into p the compiler cannot see the alignment, and measured
+    // 16 byte stores instead of 4 word stores
+    uint32_t t[W] = {};
+    __builtin_memcpy(t, &v, sizeof v);
+    for (uint32_t i = 0; i < W; i++) p[i] = t[i];
+    return p + W;
   }
-  static T get(const uint8_t *&p) {
+  static T get(const uint32_t *&p) {
     T v;
     memcpy(&v, p, sizeof v);
-    p += sizeof v;
+    p += W;
     return v;
   }
 };
 
+// measured before the ring is taken and copied no further than that: a string that changes in
+// between gives wrong text, never a read past the record
 template <>
 struct LogArg<const char *> {
-  static LOG_INLINE void put(LogRec &r, const char *s) {
-    if (r.len >= sizeof r.body - 1) return (void)(r.len = LogRec::OVER);
-    if (!s) s = "(null)";
-    size_t n = 0;
-    for (; s[n] && r.len + n < sizeof r.body - 1; n++) r.body[r.len + n] = s[n];  // a long string is cut
-    r.len += n;
-    r.body[r.len++] = 0;
+  static LOG_INLINE uint32_t bytes(const char *s) { return strnlen(s ? s : "(null)", LOG_BODY) + 1; }
+  static LOG_INLINE uint32_t *put(uint32_t *p, const char *s, uint32_t n) {
+    memcpy(p, s ? s : "(null)", n - 1);  // the length already measured: word copies in the ESP32's ROM
+    ((char *)p)[n - 1] = 0;
+    return p + (n + 3) / 4;
   }
-  static const char *get(const uint8_t *&p) {
+  static const char *get(const uint32_t *&p) {
     const char *s = (const char *)p;
-    p += strlen(s) + 1;
+    p += (strlen(s) + 4) / 4;
     return s;
   }
 };
@@ -67,7 +95,7 @@ struct LogUnpack;
 template <>
 struct LogUnpack<> {
   template <class... Got>
-  static int call(char *out, size_t cap, const char *fmt, const uint8_t *, Got... got) {
+  static int call(char *out, size_t cap, const char *fmt, const uint32_t *, Got... got) {
     return snprintf(out, cap, fmt, got...);
   }
 };
@@ -75,33 +103,34 @@ struct LogUnpack<> {
 template <class T, class... Rest>
 struct LogUnpack<T, Rest...> {
   template <class... Got>
-  static int call(char *out, size_t cap, const char *fmt, const uint8_t *p, Got... got) {
+  static int call(char *out, size_t cap, const char *fmt, const uint32_t *p, Got... got) {
     auto v = LogArg<T>::get(p);  // own statement: read before the recursion
     return LogUnpack<Rest...>::call(out, cap, fmt, p, got..., v);
   }
 };
 
 template <class... A>
-int logFormat(const LogRec &r, char *out, size_t cap) {
-  const uint8_t *p = r.body;
-  return LogUnpack<A...>::call(out, cap, r.fmt, p);
+int logFormat(const uint32_t *args, const char *fmt, char *out, size_t cap) {
+  return LogUnpack<A...>::call(out, cap, fmt, args);
 }
 
-// in rtosLogger.cpp
-void logPost(const LogRec &r);          // safe from a task or an interrupt
-extern std::atomic<uint32_t> logDrops;  // lines refused, cut, or never taken by the sink
-
-// Serial by default. Define either in the sketch to send lines elsewhere
-bool logReady();                            // false: nothing is formatted
-void logSink(const char *batch, size_t n);  // several lines, each ending in a newline
+// each argument's size noted and summed into words in one go: a constant unless there is a %s,
+// and one strnlen per %s. A loop over an array of them did not fold at -Os
+LOG_INLINE uint32_t logWords(uint32_t *) { return 0; }
+template <class T, class... R>
+LOG_INLINE uint32_t logWords(uint32_t *b, T v, R... r) {
+  return ((*b = LogArg<T>::bytes(v)) + 3) / 4 + logWords(b + 1, r...);
+}
 
 template <class... A>
 LOG_INLINE void logBuild(const char *fmt, A... args) {
-  LogRec r;
-  r.fmt = fmt, r.format = &logFormat<A...>, r.len = 0;
-  int ordered[] = {0, (LogArg<A>::put(r, args), 0)...};  // a braced list is evaluated in order
-  (void)ordered;
-  logPost(r);
+  uint32_t w[sizeof...(A) + 1];  // each argument's bytes
+  uint32_t *p = logOpen(fmt, &logFormat<A...>, logWords(w, args...));
+  if (!p) return;
+  const uint32_t *at = w;
+  int ordered[] = {0, (p = LogArg<A>::put(p, args, *at++), 0)...};  // a braced list runs in order
+  (void)ordered, (void)at;
+  logClose();
 }
 
 inline __attribute__((format(printf, 1, 2))) void logFormatCheck(const char *, ...) {}  // never called: the compiler's check

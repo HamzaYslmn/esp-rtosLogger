@@ -1,28 +1,18 @@
-// Lines to a BLE notify, a batch per packet, and to Serial when a host is there. Defining
-// logReady and logSink in the sketch replaces the library's Serial defaults
+// Every line to Serial and to a BLE notify at once. logTo says where lines go
 #include <BLEDevice.h>
-#include <BLEServer.h>
 #include <rtosLogger.h>
 
 static BLECharacteristic *out;
 static bool linked;
-
-bool logReady() { return linked || Serial; }
-
-void logSink(const char *batch, size_t n) {
-  if (linked) out->setValue((uint8_t *)batch, n), out->notify();  // the central should ask for MTU 517
-  if (Serial) Serial.write(batch, n);
-}
 
 struct OnLink : BLEServerCallbacks {
   void onConnect(BLEServer *) override { linked = true; }
   void onDisconnect(BLEServer *s) override { linked = false, s->startAdvertising(); }
 };
 
-void setup() {
-  Serial.begin(115200);
+void setupBLE() {
   BLEDevice::init("rtosLogger");
-  BLEDevice::setMTU(517);
+  BLEDevice::setMTU(517);  // one notify carries a whole batch
   BLEServer *server = BLEDevice::createServer();
   server->setCallbacks(new OnLink);
   BLEService *svc = server->createService("9b39be61-f76f-4549-8a18-3ff0c3a21191");
@@ -30,11 +20,18 @@ void setup() {
   svc->start();
   server->getAdvertising()->addServiceUUID(svc->getUUID());
   server->startAdvertising();
-  logI("advertising");
+}
+
+void setup() {
+  Serial.begin(115200);
+  setupBLE();
+  logTo([](const char *text, size_t n) {
+    if (Serial) Serial.write(text, n);  // a USB port with no host would wait out its timeout
+    if (linked) out->setValue((uint8_t *)text, n), out->notify();
+  });
 }
 
 void loop() {
-  static int n;
-  logI("line %d, %.3f", n++, n * 0.001f);
+  logI("uptime %lu ms", millis());
   delay(200);
 }
