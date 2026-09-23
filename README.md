@@ -68,7 +68,8 @@ logTo([](const char *text, size_t n) {  // several lines, each ends in a newline
 });
 ```
 
-`examples/SerialAndBle` is the whole sketch.
+`examples/SerialAndBle` is the whole sketch. `examples/SerialAndEspNow` broadcasts the lines to
+every ESP32 in range instead.
 
 ## Flags
 
