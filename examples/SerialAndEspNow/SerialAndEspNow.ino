@@ -1,4 +1,4 @@
-// Every line to Serial and broadcast over ESP-NOW: any ESP32 in range can listen, no pairing
+// Lines to Serial, and everything broadcast over ESP-NOW: any ESP32 in range can listen, no pairing
 #include <WiFi.h>
 #include <esp_now.h>
 #include <rtosLogger.h>
@@ -13,23 +13,13 @@ void setupEspNow() {
   esp_now_add_peer(&peer);
 }
 
-// a packet carries 250 bytes: cut the batch there, at a newline, so no line is split
-void espNowSend(const char *text, size_t n) {
-  while (n) {
-    size_t k = n;
-    if (k > ESP_NOW_MAX_DATA_LEN) for (k = ESP_NOW_MAX_DATA_LEN; k > 1 && text[k - 1] != '\n'; k--) {}
-    esp_now_send(EVERYONE, (const uint8_t *)text, k);
-    text += k, n -= k;
-  }
-}
-
 void setup() {
   Serial.begin(115200);
   setupEspNow();
-  logTo([](const char *text, size_t n) {
-    if (Serial) Serial.write(text, n);  // a USB port with no host would wait out its timeout
-    espNowSend(text, n);
-  });
+  logTo([](const uint8_t *data, size_t n, bool text) {
+    if (text && Serial) Serial.write(data, n);  // a USB port with no host would wait out its timeout
+    esp_now_send(EVERYONE, data, n);
+  }, ESP_NOW_MAX_DATA_LEN);  // 250: no packet is ever bigger, and no line is ever split
 }
 
 void loop() {

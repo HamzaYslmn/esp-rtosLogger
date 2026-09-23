@@ -12,9 +12,6 @@
 #ifndef LOG_DRAIN_MS
 #define LOG_DRAIN_MS 25
 #endif
-#ifndef LOG_BATCH
-#define LOG_BATCH 512  // the most one logTo call carries, and the longest line
-#endif
 #ifndef LOG_CORE
 #define LOG_CORE 0  // ESP32: keep the task off the core that cannot wait
 #endif
@@ -59,26 +56,43 @@ void IRAM_ATTR logClose() {
   portCLEAR_INTERRUPT_MASK_FROM_ISR(g.ps);
 }
 
-// the default. A USB CDC write takes what fits its FIFO and returns, so it is retried, bounded;
-// what never went is counted by the line
-static void serialOut(const char *text, size_t n) {
+// the default: lines only, since raw bytes on a terminal are noise and a byte stream has no packet
+// edges. A USB CDC write takes what fits its FIFO and returns, so it is retried, bounded; what
+// never went is counted by the line
+static void serialOut(const uint8_t *data, size_t n, bool text) {
+  if (!text) return;
   size_t at = 0;
   for (int tries = 0; at < n && tries < 40; tries++) {
-    at += Serial.write((const uint8_t *)text + at, n - at);
+    at += Serial.write(data + at, n - at);
     if (at < n) vTaskDelay(1);
   }
   uint32_t lost = 0;
-  for (; at < n; at++) lost += text[at] == '\n';
+  for (; at < n; at++) lost += data[at] == '\n';
   if (lost) logDrops.fetch_add(lost, std::memory_order_relaxed);
 }
 
 static volatile LogOut logOut = serialOut;
-void logTo(LogOut out) { logOut = out ? out : serialOut; }
+static volatile size_t logMax = LOG_BATCH;
+void logTo(LogOut out, size_t max) {
+  logOut = out ? out : serialOut;
+  logMax = max < 16 ? 16 : max > LOG_BATCH ? LOG_BATCH : max;
+}
+
+// FNV-1a 32 over the type's name as the compiler spells it after "T = ", then its size as two
+// little endian bytes. The README has the same in JavaScript, for a receiver that is not C++
+uint32_t logBinId(const char *pretty, uint32_t size) {
+  const char *s = strstr(pretty, "T = ");
+  uint32_t h = 2166136261u;
+  for (s = s ? s + 4 : pretty; *s && *s != ']' && *s != ';'; s++) h = (h ^ (uint8_t)*s) * 16777619u;
+  for (int i = 0; i < 2; i++) h = (h ^ (uint8_t)(size >> 8 * i)) * 16777619u;
+  return h;
+}
 
 // polls: waking a blocked reader measured 3 us of the caller. Formats in place, straight into
-// the batch; each ring's write index is read once a pass, so one busy core cannot starve the other
+// the packet; each ring's write index is read once a pass, so one busy core cannot starve the other.
+// A packet holds one kind, lines or one type's records, so it is sent when the kind changes
 static void logTask(void *) {
-  static char out[LOG_BATCH];
+  static uint8_t out[LOG_BATCH];
   static uint32_t seen[LOG_CORES];  // drops already folded into logDrops
   const TickType_t period = pdMS_TO_TICKS(LOG_DRAIN_MS);
   for (TickType_t spent = 0;;) {
@@ -88,7 +102,9 @@ static void logTask(void *) {
     TickType_t t0 = xTaskGetTickCount();
     LogOut send = logOut;
     bool nobody = send == serialOut && !Serial;  // a USB port with no host: nothing formatted for nobody
-    size_t n = 0;
+    size_t cap = logMax, n = 0;
+    uint32_t kind = 0;  // what the packet holds: 0 lines, else its records' type function
+    LogBinType t = {};
     for (int c = 0; c < LOG_CORES; c++) {
       LogRing &g = logRings[c];
       uint32_t w = g.w.load(std::memory_order_acquire), r = nobody ? w : g.r.load(std::memory_order_relaxed);
@@ -98,19 +114,29 @@ static void logTask(void *) {
           continue;
         }
         const uint32_t *h = g.buf + r;
-        const char *fmt = (const char *)h[0];
         LogFormat format = (LogFormat)h[1];
-        int len = format(h + 3, fmt, out + n, sizeof out - n);  // one byte is kept for the newline
-        if (len >= (int)(sizeof out - n - 1) && n) send(out, n), n = 0, len = format(h + 3, fmt, out, sizeof out);
-        n += len < 0 ? 0 : len > (int)sizeof out - 1 ? sizeof out - 1 : len;  // longer than a batch: cut
-        out[n++] = '\n';
+        uint32_t key = format ? 0 : h[0];
+        if (n && key != kind) send(out, n, !kind), n = 0;
+        kind = key;
+        if (!format) {  // a record: its id once, at the packet's head, then as many as fit
+          if (!n) t = ((LogBinType(*)())key)(), memcpy(out, &t.id, 4), n = 4;
+          if (n + t.size > cap && n > 4) send(out, n, false), n = 4;  // the id stays at the head
+          if (n + t.size <= cap) memcpy(out + n, h + 3, t.size), n += t.size;
+          else logDrops.fetch_add(1, std::memory_order_relaxed), n = 0;  // bigger than the transport's packet
+        } else {
+          char *text = (char *)out;
+          int len = format(h + 3, (const char *)h[0], text + n, cap - n);  // one byte is kept for the newline
+          if (len >= (int)(cap - n - 1) && n) send(out, n, true), n = 0, len = format(h + 3, (const char *)h[0], text, cap);
+          n += len < 0 ? 0 : len > (int)cap - 1 ? cap - 1 : len;  // longer than a packet: cut
+          out[n++] = '\n';
+        }
         g.r.store(r += h[2], std::memory_order_release);  // only now may a writer reuse it
       }
       g.r.store(r, std::memory_order_release);
       uint32_t d = g.drops;
       if (d != seen[c]) logDrops.fetch_add(d - seen[c], std::memory_order_relaxed), seen[c] = d;
     }
-    if (n) send(out, n);
+    if (n) send(out, n, !kind);
     spent = xTaskGetTickCount() - t0;
   }
 }

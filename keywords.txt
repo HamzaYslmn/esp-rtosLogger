@@ -5,3 +5,5 @@ logD	KEYWORD2
 logV	KEYWORD2
 logTo	KEYWORD2
 logDrops	KEYWORD2
+logBin	KEYWORD2
+logBinRead	KEYWORD2

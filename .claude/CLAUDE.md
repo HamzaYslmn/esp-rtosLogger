@@ -30,8 +30,12 @@ so no lock is ever shared between cores. Keep the call site small: in a sketch w
 flash, every cache line the call touches costs about a microsecond, which is most of what a cold
 call costs. `sim/` (gitignored) is the rig that measures it.
 
-`logTo(fn)` says where lines go, Serial until it is called. That is the only extension point, and
-it stays that way. With the Serial default and no USB host, nothing is formatted.
+`logTo(fn, max)` says where packets go, Serial until it is called. That is the only extension
+point, and it stays that way. With the Serial default and no USB host, nothing is formatted.
+
+`logBin(struct)` shares the rings: a record carries its type's `logBinType<T>` where a line
+carries its format, and a null `format` word marks it. Its id is FNV-1a over the type's name and
+size, worked out by the drain, never at the call, so both ends agree without numbering anything.
 
 `LOG_LEVEL` is a sketch `#define`. Everything else is a build flag, because `LOG_RING` and the
 rest also size things inside the .cpp, which a sketch define never reaches. `LOG_RING` is in the

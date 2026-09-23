@@ -9,12 +9,16 @@
 #pragma once
 #include <Arduino.h>
 #include <atomic>
+#include <type_traits>
 
 #ifndef LOG_RING
 #define LOG_RING 4096  // build flag: bytes of ring per core, the .cpp sizes it
 #endif
 #ifndef LOG_BODY
 #define LOG_BODY 500  // the longest %s kept, in bytes
+#endif
+#ifndef LOG_BATCH
+#define LOG_BATCH 512  // build flag: the largest packet, and the longest line
 #endif
 #if defined(ARDUINO_ARCH_ESP32)
 #define LOG_CORES portNUM_PROCESSORS
@@ -43,10 +47,10 @@ uint32_t *logOpen(const char *fmt, LogFormat format, uint32_t words);  // nullpt
 void logClose();
 extern std::atomic<uint32_t> logDrops;  // lines refused, or never taken by the cable
 
-// where the lines go, Serial until then: logTo([](const char *text, size_t n) { ... }). text holds
-// several lines, each ending in a newline
-typedef void (*LogOut)(const char *text, size_t n);
-void logTo(LogOut out);
+// where packets go, Serial until then. A packet is lines, each ending in a newline (text true), or
+// records of one type after its 4 byte id. max is the transport's packet: mtu - 3 for a notify
+typedef void (*LogOut)(const uint8_t *data, size_t n, bool text);
+void logTo(LogOut out, size_t max = LOG_BATCH);
 
 // one per type: its size in bytes, how the caller stores it, how the task reads it back
 template <class T>
@@ -131,6 +135,50 @@ LOG_INLINE void logBuild(const char *fmt, A... args) {
   int ordered[] = {0, (p = LogArg<A>::put(p, args, *at++), 0)...};  // a braced list runs in order
   (void)ordered, (void)at;
   logClose();
+}
+
+// logBin(value): a plain struct into the ring as bytes, sent as bytes. It has no number: its id is
+// its name and size, hashed, so both ends agree on their own and a changed struct is a new id
+struct LogBinType { uint32_t id, size; };
+uint32_t logBinId(const char *pretty, uint32_t size);  // in the .cpp: FNV-1a, the README has it
+
+// the drain calls this, never the caller: the id is worked out on the other core
+template <class T>
+LogBinType logBinType() { return {logBinId(__PRETTY_FUNCTION__, sizeof(T)), sizeof(T)}; }
+
+template <class T>
+LOG_INLINE void logBin(const T &v) {
+  static_assert(std::is_trivially_copyable<T>::value && sizeof(T) + 4 <= LOG_BATCH,
+                "logBin takes a plain struct of at most LOG_BATCH - 4 bytes");
+  // the type's function where a line's fmt goes; no format marks a record
+  uint32_t *p = logOpen((const char *)(uintptr_t)&logBinType<T>, nullptr, LogArg<T>::W);
+  if (!p) return;
+  // a word at a time: copied whole, a 32 byte struct measured three memcpy calls at the call site
+  const uint8_t *s = (const uint8_t *)&v;
+  const size_t whole = sizeof(T) / 4, tail = sizeof(T) % 4;
+  for (size_t i = 0; i < whole; i++) {
+    uint32_t w;
+    __builtin_memcpy(&w, s + 4 * i, 4);
+    p[i] = w;
+  }
+  if (tail) {
+    uint32_t w = 0;
+    __builtin_memcpy(&w, s + 4 * whole, tail);
+    p[whole] = w;
+  }
+  logClose();
+}
+
+// on the receiving end: calls fn for each T in a packet of Ts, and ignores any other packet
+template <class T, class F>
+void logBinRead(const uint8_t *data, size_t n, F fn) {
+  LogBinType t = logBinType<T>();
+  if (n < 4 || memcmp(data, &t.id, 4) || (n - 4) % t.size) return;
+  for (data += 4, n -= 4; n; data += t.size, n -= t.size) {
+    T v;
+    memcpy(&v, data, sizeof v);
+    fn(v);
+  }
 }
 
 inline __attribute__((format(printf, 1, 2))) void logFormatCheck(const char *, ...) {}  // never called: the compiler's check
