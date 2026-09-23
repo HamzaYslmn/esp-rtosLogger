@@ -9,6 +9,12 @@
 #pragma once
 #include <Arduino.h>
 #include <atomic>
+#if defined(ARDUINO_ARCH_NRF52) && defined(USE_TINYUSB)
+#include <Adafruit_TinyUSB.h>  // the Adafruit nRF52 core's Serial: without it a plain sketch fails to link
+#endif
+#ifndef IRAM_ATTR
+#define IRAM_ATTR  // nRF52: so a sketch marks its hot code the same way on both
+#endif
 #include <type_traits>
 
 #ifndef LOG_RING
@@ -57,12 +63,20 @@ template <class T>
 struct LogArg {
   static const uint32_t W = (sizeof(T) + 3) / 4;
   static LOG_INLINE uint32_t bytes(T) { return W * 4; }
-  static LOG_INLINE uint32_t *put(uint32_t *p, T v, uint32_t) {
-    // through a word array: straight into p the compiler cannot see the alignment, and measured
-    // 16 byte stores instead of 4 word stores
-    uint32_t t[W] = {};
-    __builtin_memcpy(t, &v, sizeof v);
-    for (uint32_t i = 0; i < W; i++) p[i] = t[i];
+  static LOG_INLINE uint32_t *put(uint32_t *p, const T &v, uint32_t) {
+    // a word at a time through a local: straight into p measured 16 byte stores, and a whole 32
+    // byte struct measured three memcpy calls at the call site
+    const uint8_t *s = (const uint8_t *)&v;
+    for (uint32_t i = 0; i < sizeof(T) / 4; i++) {
+      uint32_t w;
+      __builtin_memcpy(&w, s + 4 * i, 4);
+      p[i] = w;
+    }
+    if (sizeof(T) % 4) {
+      uint32_t w = 0;
+      __builtin_memcpy(&w, s + sizeof(T) / 4 * 4, sizeof(T) % 4);
+      p[sizeof(T) / 4] = w;
+    }
     return p + W;
   }
   static T get(const uint32_t *&p) {
@@ -153,32 +167,45 @@ LOG_INLINE void logBin(const T &v) {
   // the type's function where a line's fmt goes; no format marks a record
   uint32_t *p = logOpen((const char *)(uintptr_t)&logBinType<T>, nullptr, LogArg<T>::W);
   if (!p) return;
-  // a word at a time: copied whole, a 32 byte struct measured three memcpy calls at the call site
-  const uint8_t *s = (const uint8_t *)&v;
-  const size_t whole = sizeof(T) / 4, tail = sizeof(T) % 4;
-  for (size_t i = 0; i < whole; i++) {
-    uint32_t w;
-    __builtin_memcpy(&w, s + 4 * i, 4);
-    p[i] = w;
-  }
-  if (tail) {
-    uint32_t w = 0;
-    __builtin_memcpy(&w, s + 4 * whole, tail);
-    p[whole] = w;
-  }
+  LogArg<T>::put(p, v, 0);
   logClose();
 }
 
-// on the receiving end: calls fn for each T in a packet of Ts, and ignores any other packet
-template <class T, class F>
-void logBinRead(const uint8_t *data, size_t n, F fn) {
-  LogBinType t = logBinType<T>();
-  if (n < 4 || memcmp(data, &t.id, 4) || (n - 4) % t.size) return;
-  for (data += 4, n -= 4; n; data += t.size, n -= t.size) {
-    T v;
-    memcpy(&v, data, sizeof v);
-    fn(v);
-  }
+// on the receiving board, from the one callback the packets arrive in: lines go straight out through
+// logTo, and each struct type logBinRead asks for keeps only its newest. Not from an interrupt
+void logFrom(const void *data, size_t n);
+
+// one per type read, made before setup() so logFrom knows it from the first packet. seq is odd
+// while logFrom writes it
+struct LogSlot {
+  LogSlot(uint32_t id, uint32_t size, void *data);  // joins the list logFrom looks in
+  LogSlot *next;
+  uint32_t id, size;
+  void *data;
+  std::atomic<uint32_t> seq;
+  uint32_t seen;
+};
+bool logBinTake(LogSlot &s, void *out);
+
+template <class T>
+struct LogBinSlot {
+  static uint32_t data[(sizeof(T) + 3) / 4];
+  static LogSlot slot;
+};
+template <class T>
+uint32_t LogBinSlot<T>::data[(sizeof(T) + 3) / 4];
+template <class T>
+LogSlot LogBinSlot<T>::slot(logBinType<T>().id, sizeof(T), LogBinSlot<T>::data);
+
+// logBinRead(pedal): true and pedal updated when a newer T came, else false and pedal untouched.
+// Never waits, takes no lock, masks no interrupt
+template <class T>
+bool logBinRead(T &out) {
+  static_assert(std::is_trivially_copyable<T>::value, "logBinRead takes a plain struct");
+  T got;
+  if (!logBinTake(LogBinSlot<T>::slot, &got)) return false;
+  out = got;  // only a whole one: a copy torn by logFrom was thrown away
+  return true;
 }
 
 inline __attribute__((format(printf, 1, 2))) void logFormatCheck(const char *, ...) {}  // never called: the compiler's check

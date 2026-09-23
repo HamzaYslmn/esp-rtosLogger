@@ -50,6 +50,8 @@ with `IRAM_ATTR` and it runs from RAM, at the numbers above:
 void IRAM_ATTR motorLoop() { ... logI("trip at %d rpm", rpm); ... }
 ```
 
+On the nRF52 `IRAM_ATTR` is nothing, so the same code builds on both.
+
 A sketch with more than a few lines in IRAM also needs a file named `build_opt.h` next to it,
 holding one line: `-mtext-section-literals`.
 
@@ -71,8 +73,16 @@ logTo([](const uint8_t *data, size_t n, bool text) {  // several lines, each end
 Add a second argument to cap the packet size for your transport: `logTo(fn, 250)` for ESP-NOW,
 the MTU less 3 for a Bluetooth notify. The default is 512. A line is never split between packets.
 
-The examples are whole sketches: `SerialAndBle` for Bluetooth, `SerialAndEspNow` to broadcast to
-every ESP32 nearby.
+The examples are whole sketches, a sender and its receiver for two ESP32s:
+
+| sender | receiver | link |
+|---|---|---|
+| `SerialAndEspNow` | `EspNowReceiver` | ESP-NOW broadcast, no pairing, any number of listeners |
+| `SerialAndBle` | `BleReceiver` | a Bluetooth notify, which a phone app can read too |
+
+Each sender logs from the loop in flash, a hot function in RAM, and a timer interrupt, and sends a
+struct with `logBin`. `Basic` is Serial only. `Loopback` needs one board and prints both kinds of
+packet byte by byte, as the other board would get them.
 
 ## Send structs instead of text
 
@@ -85,12 +95,23 @@ struct Sample { uint32_t ms; int16_t rpm, amps; };  // in a header both boards i
 logBin(Sample{millis(), rpm, amps});                // on the sender, from anywhere logI works
 ```
 
-On the receiving board, for every packet that arrives, however it came:
+On the receiving board, pass every packet to `logFrom`, the mirror of `logTo`. Then read the struct
+anywhere:
 
 ```cpp
-logBinRead<Sample>(data, n, [](const Sample &s) { ... });  // other packets are ignored
+logFrom(data, n);            // in the callback your packets arrive in: lines print, structs are kept
+
+static Sample s;             // holds the newest
+if (logBinRead(s)) gauge(s); // true when a newer one came; s is left alone otherwise
 ```
 
+- `logBinRead` gives the newest, like reading a pin: right for state such as a pedal or a gauge.
+  To keep every struct, a log or a graph, read the packets in `logFrom`'s place instead.
+- It never waits, takes no lock and masks no interrupt, so it is safe on your busy core: 0.1 us,
+  0.6 at worst, measured every pass of a SimpleFOC loop in IRAM on an ESP32-S3.
+- Call `logFrom` from one place only.
+- Cap `logTo` at what one write really carries. A Bluetooth link left at the default MTU carries
+  20 bytes: a bigger packet arrives in pieces, and `logFrom` ignores them.
 - Any plain struct up to 508 bytes. Declare it once, in a header both boards share.
 - You never number it. Its id comes from its name and size, so both boards agree on their own, and
   a changed struct gets a new id that an old receiver ignores instead of misreading.
@@ -117,7 +138,7 @@ function logBinId(name, size) {  // matches the packet's first 4 bytes, little e
   let h = 0x811c9dc5;
   for (const b of [...new TextEncoder().encode(name), size & 255, (size >> 8) & 255])
     h = Math.imul(h ^ b, 0x01000193) >>> 0;
-  return h;
+  return (h & 255) === 0x5b ? h ^ 1 : h;  // never starts with '[', which starts every line
 }
 ```
 

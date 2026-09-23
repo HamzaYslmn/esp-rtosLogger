@@ -1,19 +1,32 @@
-// Lines to Serial, lines and records to a BLE notify. logTo says where packets go
+// Sender: lines to Serial, lines and structs to a BLE notify. BleReceiver on a second ESP32 prints
+// them, or any BLE app subscribed to the characteristic below
 #include <BLEDevice.h>
 #include <rtosLogger.h>
 
-struct Sample {  // a record: declare it once, in a header the receiving end shares
+struct Sample {  // the receiver declares the same struct; in a real project, one header both include
   uint32_t ms;
   int16_t rpm, amps;
 };
 
 static BLECharacteristic *out;
 static bool linked;
+static hw_timer_t *timer;
+static volatile int rpm, amps;
 
 struct OnLink : BLEServerCallbacks {
   void onConnect(BLEServer *) override { linked = true; }
   void onDisconnect(BLEServer *s) override { linked = false, s->startAdvertising(); }
 };
+
+void IRAM_ATTR onTimer() {  // an interrupt: logI is safe here, Serial.printf is not
+  static uint32_t ticks;
+  if (++ticks % 1000 == 0) logI("isr: %lu ticks", (unsigned long)ticks);
+}
+
+void IRAM_ATTR control() {  // the hot path, in RAM: about 1 us a call, never a flash fetch
+  if (amps > 35) logW("over %d A at %d rpm", amps, rpm);
+  logBin(Sample{millis(), (int16_t)rpm, (int16_t)amps});  // telemetry: a struct, nothing formatted
+}
 
 void setupBLE() {
   BLEDevice::init("rtosLogger");
@@ -34,10 +47,16 @@ void setup() {
     if (text && Serial) Serial.write(data, n);  // a USB port with no host would wait out its timeout
     if (linked) out->setValue((uint8_t *)data, n), out->notify();
   });
+  timer = timerBegin(1000000);
+  timerAttachInterrupt(timer, onTimer);
+  timerAlarm(timer, 1000, true, 0);  // every 1 ms
 }
 
-void loop() {
-  logI("uptime %lu ms", millis());
-  logBin(Sample{millis(), 1200, 35});  // the receiver: logBinRead<Sample>(data, n, [](const Sample &s) {...})
-  delay(200);
+void loop() {  // plain code runs from flash: fine where a few us more does not matter
+  rpm = 1200 + random(-50, 50);
+  amps = random(20, 40);
+  control();
+  static uint32_t last;
+  if (millis() - last >= 1000) last = millis(), logI("uptime %lu ms, %lu dropped", last, (unsigned long)logDrops.load());
+  delay(20);
 }

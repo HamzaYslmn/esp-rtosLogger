@@ -5,7 +5,6 @@
 #if defined(ARDUINO_ARCH_ESP32)
 #define logCore() xPortGetCoreID()
 #else
-#define IRAM_ATTR
 #define logCore() 0
 #endif
 
@@ -85,7 +84,44 @@ uint32_t logBinId(const char *pretty, uint32_t size) {
   uint32_t h = 2166136261u;
   for (s = s ? s + 4 : pretty; *s && *s != ']' && *s != ';'; s++) h = (h ^ (uint8_t)*s) * 16777619u;
   for (int i = 0; i < 2; i++) h = (h ^ (uint8_t)(size >> 8 * i)) * 16777619u;
-  return h;
+  return (h & 0xFF) == '[' ? h ^ 1 : h;  // every line starts with '[', so a packet's first byte says which it is
+}
+
+// one slot per type read, each with its newest struct. No lock: logFrom makes seq odd while it
+// writes, and a read that saw it odd or changed is thrown away, so a reader never spins
+static std::atomic<LogSlot *> logSlots(nullptr);
+
+LogSlot::LogSlot(uint32_t id, uint32_t size, void *data) : next(nullptr), id(id), size(size), data(data), seq(0), seen(0) {
+  next = logSlots.load(std::memory_order_relaxed);
+  while (!logSlots.compare_exchange_weak(next, this, std::memory_order_release)) {}
+}
+
+void logFrom(const void *data, size_t n) {
+  const uint8_t *p = (const uint8_t *)data;
+  if (n && p[0] == '[') return logOut(p, n, true);  // lines: out the way this board's own go
+  if (n <= 4) return;
+  uint32_t id;
+  memcpy(&id, p, 4);
+  for (LogSlot *s = logSlots.load(std::memory_order_acquire); s; s = s->next) {
+    if (s->id != id || (n - 4) % s->size) continue;
+    uint32_t q = s->seq.load(std::memory_order_relaxed);
+    s->seq.store(q + 1, std::memory_order_relaxed);
+    std::atomic_thread_fence(std::memory_order_seq_cst);  // odd is seen before the bytes change
+    memcpy(s->data, p + n - s->size, s->size);  // the packet's last is its newest
+    s->seq.store(q + 2, std::memory_order_release);
+    return;
+  }
+}
+
+// in IRAM: a motor loop reads every pass, and from flash its worst read measured 8.8 us, here 0.6
+bool IRAM_ATTR logBinTake(LogSlot &s, void *out) {
+  uint32_t q = s.seq.load(std::memory_order_acquire);
+  if (q == s.seen || (q & 1)) return false;  // nothing new, or being written: the next call gets it
+  memcpy(out, s.data, s.size);
+  std::atomic_thread_fence(std::memory_order_acquire);
+  if (s.seq.load(std::memory_order_relaxed) != q) return false;  // written over while copied
+  s.seen = q;
+  return true;
 }
 
 // polls: waking a blocked reader measured 3 us of the caller. Formats in place, straight into
