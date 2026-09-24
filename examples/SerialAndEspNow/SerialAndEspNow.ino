@@ -13,14 +13,19 @@ static const uint8_t EVERYONE[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 static hw_timer_t *timer;
 static volatile int rpm, amps;
 
+void airSend(const uint8_t *data, size_t n, bool) { esp_now_send(EVERYONE, data, n); }  // an error until setup starts it
+
+LogOutput serial(logSerial);  // making any output drops the Serial default, so it is made too
+LogOutput air(airSend, ESP_NOW_MAX_DATA_LEN);  // 250: no packet for the air is bigger, no line split
+
 void IRAM_ATTR onTimer() {  // an interrupt: logI is safe here, Serial.printf is not
   static uint32_t ticks;
-  if (++ticks % 1000 == 0) logI("isr: %lu ticks", (unsigned long)ticks);
+  if (++ticks % 1000 == 0) logI(serial, "isr: %lu ticks", (unsigned long)ticks);  // Serial only
 }
 
 void IRAM_ATTR control() {  // the hot path, in RAM: about 1 us a call, never a flash fetch
-  if (amps > 35) logW("over %d A at %d rpm", amps, rpm);
-  logBin(Sample{millis(), (int16_t)rpm, (int16_t)amps});  // telemetry: a struct, nothing formatted
+  if (amps > 35) logW("over %d A at %d rpm", amps, rpm);  // every output
+  logBin(air, Sample{millis(), (int16_t)rpm, (int16_t)amps});  // telemetry: a struct, nothing formatted, air only
 }
 
 void setupEspNow() {
@@ -34,10 +39,6 @@ void setupEspNow() {
 void setup() {
   Serial.begin(115200);
   setupEspNow();
-  logTo([](const uint8_t *data, size_t n, bool text) {
-    if (text && Serial) Serial.write(data, n);  // a USB port with no host would wait out its timeout
-    esp_now_send(EVERYONE, data, n);
-  }, ESP_NOW_MAX_DATA_LEN);  // 250: no packet is ever bigger, and no line is ever split
   timer = timerBegin(1000000);
   timerAttachInterrupt(timer, onTimer);
   timerAlarm(timer, 1000, true, 0);  // every 1 ms

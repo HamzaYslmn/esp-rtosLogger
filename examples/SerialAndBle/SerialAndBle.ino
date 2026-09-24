@@ -18,14 +18,21 @@ struct OnLink : BLEServerCallbacks {
   void onDisconnect(BLEServer *s) override { linked = false, s->startAdvertising(); }
 };
 
+void bleSend(const uint8_t *data, size_t n, bool) {  // several lines each ending in a newline, or structs
+  if (linked) out->setValue((uint8_t *)data, n), out->notify();
+}
+
+LogOutput serial(logSerial);  // making any output drops the Serial default, so it is made too
+LogOutput ble(bleSend);
+
 void IRAM_ATTR onTimer() {  // an interrupt: logI is safe here, Serial.printf is not
   static uint32_t ticks;
-  if (++ticks % 1000 == 0) logI("isr: %lu ticks", (unsigned long)ticks);
+  if (++ticks % 1000 == 0) logI(serial, "isr: %lu ticks", (unsigned long)ticks);  // Serial only
 }
 
 void IRAM_ATTR control() {  // the hot path, in RAM: about 1 us a call, never a flash fetch
-  if (amps > 35) logW("over %d A at %d rpm", amps, rpm);
-  logBin(Sample{millis(), (int16_t)rpm, (int16_t)amps});  // telemetry: a struct, nothing formatted
+  if (amps > 35) logW("over %d A at %d rpm", amps, rpm);  // every output
+  logBin(ble, Sample{millis(), (int16_t)rpm, (int16_t)amps});  // telemetry: a struct, nothing formatted, BLE only
 }
 
 void setupBLE() {
@@ -43,10 +50,6 @@ void setupBLE() {
 void setup() {
   Serial.begin(115200);
   setupBLE();
-  logTo([](const uint8_t *data, size_t n, bool text) {
-    if (text && Serial) Serial.write(data, n);  // a USB port with no host would wait out its timeout
-    if (linked) out->setValue((uint8_t *)data, n), out->notify();
-  });
   timer = timerBegin(1000000);
   timerAttachInterrupt(timer, onTimer);
   timerAlarm(timer, 1000, true, 0);  // every 1 ms

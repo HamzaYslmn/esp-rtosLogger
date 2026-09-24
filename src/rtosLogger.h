@@ -49,14 +49,24 @@ extern LogRing logRings[LOG_CORES];
 
 // in rtosLogger.cpp, in IRAM: the part every call site shares, so it is never a cache miss
 typedef int (*LogFormat)(const uint32_t *args, const char *fmt, char *out, size_t cap);
-uint32_t *logOpen(const char *fmt, LogFormat format, uint32_t words);  // nullptr: full, counted
+// head: the level in the low 3 bits, the record's words, header included, in the next 16, and the
+// outputs it skips in the 8 above. Every output is 0, so a line's head is a constant under 2048,
+// which the call site loads as an immediate: a larger one is a literal read, measured 0.4 us cold
+uint32_t *logOpen(const char *fmt, LogFormat format, uint32_t head);  // nullptr: full, counted
 void logClose();
 extern std::atomic<uint32_t> logDrops;  // lines refused, or never taken by the cable
 
-// where packets go, Serial until then. A packet is lines, each ending in a newline (text true), or
-// records of one type after its 4 byte id. max is the transport's packet: mtu - 3 for a notify
-typedef void (*LogOut)(const uint8_t *data, size_t n, bool text);
-void logTo(LogOut out, size_t max = LOG_BATCH);
+// Where packets go. A packet is lines, each ending in a newline (text true), or records of one type
+// after its 4 byte id. max is the transport's packet: mtu - 3 for a notify. With no output made,
+// lines go to Serial; once one is, only to the ones made. Make them as globals, eight at most
+typedef void (*LogSend)(const uint8_t *data, size_t n, bool text);
+#define LOG_OUTPUTS 8
+struct LogOutput {
+  explicit LogOutput(LogSend send, size_t max = LOG_BATCH);  // the same send twice is one output
+  uint8_t bits;
+};
+inline LogOutput operator|(LogOutput a, LogOutput b) { return a.bits |= b.bits, a; }
+void logSerial(const uint8_t *data, size_t n, bool text);  // lines to Serial: LogOutput serial(logSerial)
 
 // one per type: its size in bytes, how the caller stores it, how the task reads it back
 template <class T>
@@ -141,15 +151,30 @@ LOG_INLINE uint32_t logWords(uint32_t *b, T v, R... r) {
 }
 
 template <class... A>
-LOG_INLINE void logBuild(const char *fmt, A... args) {
+LOG_INLINE void logPut(uint32_t head, const char *fmt, A... args) {
   uint32_t w[sizeof...(A) + 1];  // each argument's bytes
-  uint32_t *p = logOpen(fmt, &logFormat<A...>, logWords(w, args...));
+  uint32_t *p = logOpen(fmt, &logFormat<A...>, (logWords(w, args...) + 3) << 3 | head);
   if (!p) return;
   const uint32_t *at = w;
   int ordered[] = {0, (p = LogArg<A>::put(p, args, *at++), 0)...};  // a braced list runs in order
   (void)ordered, (void)at;
   logClose();
 }
+
+// logI("x") to every output, logI(ble, "x") to the ones named. A format taken as an array refuses
+// a pointer, and a char array is refused below, so the format is a literal: it is read later
+template <size_t N, class... A>
+LOG_INLINE void logBuild(uint32_t level, const char (&fmt)[N], A... args) {
+  logPut(level, fmt, args...);
+}
+template <size_t N, class... A>
+LOG_INLINE void logBuild(uint32_t level, LogOutput to, const char (&fmt)[N], A... args) {
+  logPut(level | (uint32_t)(uint8_t)~to.bits << 19, fmt, args...);
+}
+template <size_t N, class... A>
+void logBuild(uint32_t, char (&)[N], A...) = delete;
+template <size_t N, class... A>
+void logBuild(uint32_t, LogOutput, char (&)[N], A...) = delete;
 
 // logBin(value): a plain struct into the ring as bytes, sent as bytes. It has no number: its id is
 // its name and size, hashed, so both ends agree on their own and a changed struct is a new id
@@ -161,18 +186,24 @@ template <class T>
 LogBinType logBinType() { return {logBinId(__PRETTY_FUNCTION__, sizeof(T)), sizeof(T)}; }
 
 template <class T>
-LOG_INLINE void logBin(const T &v) {
+LOG_INLINE void logBinPut(uint32_t skip, const T &v) {
   static_assert(std::is_trivially_copyable<T>::value && sizeof(T) + 4 <= LOG_BATCH,
                 "logBin takes a plain struct of at most LOG_BATCH - 4 bytes");
   // the type's function where a line's fmt goes; no format marks a record
-  uint32_t *p = logOpen((const char *)(uintptr_t)&logBinType<T>, nullptr, LogArg<T>::W);
+  uint32_t *p = logOpen((const char *)(uintptr_t)&logBinType<T>, nullptr, (LogArg<T>::W + 3) << 3 | skip << 19);
   if (!p) return;
   LogArg<T>::put(p, v, 0);
   logClose();
 }
 
-// on the receiving board, from the one callback the packets arrive in: lines go straight out through
-// logTo, and each struct type logBinRead asks for keeps only its newest. Not from an interrupt
+// logBin(v) to every output, logBin(ble, v) to the ones named
+template <class T>
+LOG_INLINE void logBin(const T &v) { logBinPut(0, v); }
+template <class T>
+LOG_INLINE void logBin(LogOutput to, const T &v) { logBinPut((uint8_t)~to.bits, v); }
+
+// on the receiving board, from the one callback the packets arrive in: lines go straight out to
+// every output, and each struct type logBinRead asks for keeps only its newest. Not from an interrupt
 void logFrom(const void *data, size_t n);
 
 // one per type read, made before setup() so logFrom knows it from the first packet. seq is odd
@@ -208,17 +239,19 @@ bool logBinRead(T &out) {
   return true;
 }
 
-inline __attribute__((format(printf, 1, 2))) void logFormatCheck(const char *, ...) {}  // never called: the compiler's check
+// never called: the compiler's check of the format against the arguments, with an output or without
+inline __attribute__((format(printf, 1, 2))) void logFormatCheck(const char *, ...) {}
+inline __attribute__((format(printf, 2, 3))) void logFormatCheck(LogOutput, const char *, ...) {}
 
-// the concatenation puts the level in the literal and refuses a non literal format
-#define logAt(tag, fmt, ...) (false ? logFormatCheck(fmt, ##__VA_ARGS__) : logBuild(tag " " fmt, ##__VA_ARGS__))
+// the level goes in the record, and the drain writes its tag: the format no longer comes first
+#define logAt(level, ...) (false ? logFormatCheck(__VA_ARGS__) : logBuild(level, __VA_ARGS__))
 
 // a level above LOG_LEVEL is a constant false branch: the compiler emits nothing for it
 #ifndef LOG_LEVEL
 #define LOG_LEVEL 5  // 1 error, 2 warn, 3 info, 4 debug, 5 verbose
 #endif
-#define logE(...) (LOG_LEVEL >= 1 ? logAt("[E]", __VA_ARGS__) : (void)0)
-#define logW(...) (LOG_LEVEL >= 2 ? logAt("[W]", __VA_ARGS__) : (void)0)
-#define logI(...) (LOG_LEVEL >= 3 ? logAt("[I]", __VA_ARGS__) : (void)0)
-#define logD(...) (LOG_LEVEL >= 4 ? logAt("[D]", __VA_ARGS__) : (void)0)
-#define logV(...) (LOG_LEVEL >= 5 ? logAt("[V]", __VA_ARGS__) : (void)0)
+#define logE(...) (LOG_LEVEL >= 1 ? logAt(1, __VA_ARGS__) : (void)0)
+#define logW(...) (LOG_LEVEL >= 2 ? logAt(2, __VA_ARGS__) : (void)0)
+#define logI(...) (LOG_LEVEL >= 3 ? logAt(3, __VA_ARGS__) : (void)0)
+#define logD(...) (LOG_LEVEL >= 4 ? logAt(4, __VA_ARGS__) : (void)0)
+#define logV(...) (LOG_LEVEL >= 5 ? logAt(5, __VA_ARGS__) : (void)0)

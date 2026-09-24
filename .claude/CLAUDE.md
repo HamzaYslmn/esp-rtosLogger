@@ -30,8 +30,19 @@ so no lock is ever shared between cores. Keep the call site small: in a sketch w
 flash, every cache line the call touches costs about a microsecond, which is most of what a cold
 call costs. `sim/` (gitignored) is the rig that measures it.
 
-`logTo(fn, max)` says where packets go, Serial until it is called. That is the only extension
-point, and it stays that way. With the Serial default and no USB host, nothing is formatted.
+A `LogOutput` says where packets go: Serial until one is made, then only the ones made. That is
+the only extension point, and it stays that way. `logI(out, ...)` names outputs, every one
+otherwise; the record carries them, with its level, in its length word, and the drain writes the
+`[I] ` tag, since a format that no longer comes first cannot be glued to it. A packet holds one
+kind for one set of outputs, cut at the smallest of their `max`. A record no live output wants,
+Serial with no USB host included, is never formatted. An output made twice with the same function
+is one output, so a header can make one. Anything else, a connection, a rate, is the send
+function's.
+
+**Keep a call's constant small.** The word is packed level, length, then the outputs a call skips,
+so a line to every output is a constant under 2048, which the call site loads as an immediate. The
+first 0.4.0 put the outputs on top, `0xFF03xxxx`: the compiler read it from a literal pool, which
+for a call site in flash is a cache miss, and a call from a BLE callback went from 1.7 us to 2.2.
 
 `logBin(struct)` shares the rings: a record carries its type's `logBinType<T>` where a line
 carries its format, and a null `format` word marks it. Its id is FNV-1a over the type's name and

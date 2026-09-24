@@ -17,10 +17,11 @@ void wire(const uint8_t *data, size_t n, bool text) {
   logFrom(data, n);  // what the other board does. Lines stay out: logFrom would hand them straight back here
 }
 
+LogOutput air(wire);  // the only output, so nothing goes to Serial but what wire() prints
+
 void setup() {
   Serial.begin(115200);
   pinMode(PIN, INPUT_PULLUP);
-  logTo(wire);
 }
 
 void loop() {

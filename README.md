@@ -60,18 +60,36 @@ of formatting, 250 us with USB's own work. At 2000 lines a second nothing was lo
 
 ## Send lines somewhere else
 
-`logTo` says where the text goes. Until you call it, it goes to `Serial`. This sends every line to
-the serial port and over Bluetooth:
+Until you make an output, lines go to `Serial`. Make one, as a global, and they go to the outputs
+you made. This sends every line to the serial port and over Bluetooth:
 
 ```cpp
-logTo([](const uint8_t *data, size_t n, bool text) {  // several lines, each ending in a newline
-  if (text && Serial) Serial.write(data, n);
+void bleSend(const uint8_t *data, size_t n, bool text) {  // several lines, each ending in a newline
   if (linked) out->setValue((uint8_t *)data, n), out->notify();
-});
+}
+
+LogOutput serial(logSerial);  // logSerial is the built in Serial writer
+LogOutput ble(bleSend);
 ```
 
-Add a second argument to cap the packet size for your transport: `logTo(fn, 250)` for ESP-NOW,
-the MTU less 3 for a Bluetooth notify. The default is 512. A line is never split between packets.
+Every line goes to every output. Name one first and it goes only there:
+
+```cpp
+logI("to both");
+logI(ble, "BLE only");
+logD(serial, "raw adc %d", raw);
+logW(serial | ble, "any combination");
+logBin(ble, sample);
+```
+
+A wrapper of your own is one line: `#define dbg(...) logD(serial, __VA_ARGS__)`.
+
+Add a second argument to cap the packet size for your transport: `LogOutput air(airSend, 250)` for
+ESP-NOW, the MTU less 3 for a Bluetooth notify. The default is 512. A packet going to several
+outputs is cut at the smallest of theirs. A line is never split between packets.
+
+Eight outputs at most. Lines only a Serial with no USB host would get are never formatted. Anything
+else, a connection, a rate limit, is your send function's to decide.
 
 The examples are whole sketches, a sender and its receiver for two ESP32s:
 
@@ -95,11 +113,11 @@ struct Sample { uint32_t ms; int16_t rpm, amps; };  // in a header both boards i
 logBin(Sample{millis(), rpm, amps});                // on the sender, from anywhere logI works
 ```
 
-On the receiving board, pass every packet to `logFrom`, the mirror of `logTo`. Then read the struct
+On the receiving board, pass every packet to `logFrom`, the mirror of an output. Then read the struct
 anywhere:
 
 ```cpp
-logFrom(data, n);            // in the callback your packets arrive in: lines print, structs are kept
+logFrom(data, n);            // in the callback your packets arrive in: lines go out, structs are kept
 
 static Sample s;             // holds the newest
 if (logBinRead(s)) gauge(s); // true when a newer one came; s is left alone otherwise
@@ -110,13 +128,13 @@ if (logBinRead(s)) gauge(s); // true when a newer one came; s is left alone othe
 - It never waits, takes no lock and masks no interrupt, so it is safe on your busy core: 0.1 us,
   0.6 at worst, measured every pass of a SimpleFOC loop in IRAM on an ESP32-S3.
 - Call `logFrom` from one place only.
-- Cap `logTo` at what one write really carries. A Bluetooth link left at the default MTU carries
+- Cap the output at what one write really carries. A Bluetooth link left at the default MTU carries
   20 bytes: a bigger packet arrives in pieces, and `logFrom` ignores them.
 - Any plain struct up to 508 bytes. Declare it once, in a header both boards share.
 - You never number it. Its id comes from its name and size, so both boards agree on their own, and
   a changed struct gets a new id that an old receiver ignores instead of misreading.
-- Structs reach your `logTo` function with `text` false, as a 4 byte id and then the structs. The
-  default `Serial` output skips them.
+- Structs reach your send function with `text` false, as a 4 byte id and then the structs.
+  `logSerial` skips them. `logBin(ble, s)` sends one to the outputs you name.
 - `LOG_LEVEL` does not remove them: they are data, not messages.
 
 Measured with a 32 byte packet of 16 fields, 1000 a second, against the same data as a `logI` line:
@@ -176,7 +194,7 @@ pair Bluetooth with encryption if that matters.
 
 Each core has its own buffer. A call pauses its own core's interrupts for the few stores it takes,
 so tasks and interrupts on one core never collide, and the two cores never wait for each other.
-The background task wakes every 25 ms, formats what is waiting, and hands it to `logTo`.
+The background task wakes every 25 ms, formats what is waiting, and hands it to the outputs.
 
 ## Boards
 
