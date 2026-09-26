@@ -2,20 +2,18 @@
 
 `printf` style logging that does not make your code wait, for ESP32 and nRF52.
 
-`Serial.printf` formats the text and pushes it out the port before it returns: 85 us on an
-ESP32-S3, and 270 us when the port is busy. That is too slow for a motor loop or an interrupt.
-`logI` only stores the numbers you pass and returns, in about a microsecond. A background task
-turns them into text and prints them a few milliseconds later.
+`Serial.printf` takes 85 us or more, too slow for a motor loop or an interrupt. `logI` just saves
+your numbers and returns in about 1 us. A background task prints them a moment later.
 
 ## Quick start
 
 ```cpp
 #include <rtosLogger.h>
 
-void setup() { Serial.begin(115200); }  // nothing else to start
+void setup() { Serial.begin(115200); }
 
 void loop() {
-  logI("rpm=%d temp=%.2f", rpm, temp);  // prints: [I] rpm=1200 temp=31.50
+  logI("rpm=%d temp=%.2f", rpm, temp);  // [I] rpm=1200 temp=31.50
   logW("over %d A", amps);              // [W] over 12 A
   logE("trip: %s", why);                // [E] trip: stall
   logD("pwm=%u", duty);                 // [D] pwm=812
@@ -23,178 +21,119 @@ void loop() {
 }
 ```
 
-It works the same from any task, on either core, and from inside an interrupt.
-
-`#define LOG_LEVEL 3` before the include keeps errors, warnings and info, and removes the other two
-from the program entirely. The default, 5, keeps everything.
+It works from any task, either core, and inside an interrupt. `#define LOG_LEVEL 3` before the
+include keeps only errors, warnings and info.
 
 ## How fast
 
-What the line of code costs the code that calls it, measured on real boards while they ran a
-motor drive (SimpleFOC at 45 000 rpm with its interrupts) and Bluetooth:
-
 | | `Serial.printf` | `logI` |
 |---|---|---|
-| ESP32-S3, typical | 85 us | **0.9 us** |
-| ESP32-S3, worst | 273 us | **1.4 us** |
-| ESP32-S3, inside an interrupt | not safe | **0.5 us**, worst 0.7 |
-| nRF52840, typical / worst | 48 / 64 us | **4.4 / 6.4 us** |
-| nRF52840, inside an interrupt | not safe | **2.0 us**, worst 2.2 |
+| ESP32-S3 | 85 us, worst 273 | **0.9 us**, worst 1.4 |
+| ESP32-S3, in an interrupt | not safe | **0.5 us** |
+| nRF52840 | 48 us, worst 64 | **4.4 us**, worst 6.4 |
 
-**The ESP32 numbers need your loop in RAM.** Normal Arduino code runs from flash, through a small
-cache the two cores share. A `logI` that has not run for a while must be fetched into that cache
-first, and then it costs 4 to 6 us, up to 17 us at worst. Mark the function that cannot wait
-with `IRAM_ATTR` and it runs from RAM, at the numbers above:
+Measured while a motor drive and Bluetooth ran.
+
+## Keeping your busy core free (ESP32)
+
+1. **Put the busy function in RAM** with `IRAM_ATTR`. From flash a `logI` can cost up to 17 us.
+   With many lines in RAM, add a file `build_opt.h` next to your sketch holding
+   `-mtext-section-literals`.
+2. **Start Serial on core 0.** A port's interrupt runs on the core that called `begin`, and
+   `setup()` is core 1. The examples all do it this way:
 
 ```cpp
-void IRAM_ATTR motorLoop() { ... logI("trip at %d rpm", rpm); ... }
+void core0Task(void *) { Serial.begin(115200); vTaskDelete(nullptr); }
+void core1Task(void *) { for (;;) motorLoop(); }
+
+void setup() {
+  xTaskCreatePinnedToCore(core0Task, "core0Task", 8192, nullptr, 1, nullptr, 0);
+  xTaskCreatePinnedToCore(core1Task, "core1Task", 8192, nullptr, 2, nullptr, 1);
+}
+void loop() { vTaskDelete(nullptr); }
 ```
 
-On the nRF52 `IRAM_ATTR` is nothing, so the same code builds on both.
+3. **On an S3 USB port in TinyUSB mode**, also add these to `core0Task`. USB has a task of its own
+   that would otherwise run on core 1:
 
-A sketch with more than a few lines in IRAM also needs a file named `build_opt.h` next to it,
-holding one line: `-mtext-section-literals`.
+```cpp
+vTaskPrioritySet(xTaskGetHandle("usbd"), 1);
+Serial.setTxTimeoutMs(0);
+```
 
-The work does not vanish, it moves to the background task on the other core: about 140 us a line
-of formatting, 250 us with USB's own work. At 2000 lines a second nothing was lost.
+On an S3 at 2000 lines a second, `begin` in `setup()` cost core 1 2.4% (hardware CDC) to 5.1%
+(TinyUSB). Done as above, 0.45%, and no line was lost.
 
 ## Send lines somewhere else
 
-Until you make an output, lines go to `Serial`. Make one, as a global, and they go to the outputs
-you made. This sends every line to the serial port and over Bluetooth:
+Lines go to `Serial` until you make an output. Once you make any, they go to the ones you made:
 
 ```cpp
-void bleSend(const uint8_t *data, size_t n, bool text) {  // several lines, each ending in a newline
+void bleSend(const uint8_t *data, size_t n, bool text) {
   if (linked) out->setValue((uint8_t *)data, n), out->notify();
 }
 
-LogOutput serial(logSerial);  // logSerial is the built in Serial writer
+LogOutput serial(logSerial);  // the built in Serial writer
 LogOutput ble(bleSend);
-```
 
-Every line goes to every output. Name one first and it goes only there:
-
-```cpp
 logI("to both");
 logI(ble, "BLE only");
-logD(serial, "raw adc %d", raw);
 logW(serial | ble, "any combination");
-logBin(ble, sample);
 ```
 
-A wrapper of your own is one line: `#define dbg(...) logD(serial, __VA_ARGS__)`.
-
-Add a second argument to cap the packet size for your transport: `LogOutput air(airSend, 250)` for
-ESP-NOW, the MTU less 3 for a Bluetooth notify. The default is 512. A packet going to several
-outputs is cut at the smallest of theirs. A line is never split between packets.
-
-Eight outputs at most. Lines only a Serial with no USB host would get are never formatted. Anything
-else, a connection, a rate limit, is your send function's to decide.
-
-The examples are whole sketches, a sender and its receiver for two ESP32s:
-
-| sender | receiver | link |
-|---|---|---|
-| `SerialAndEspNow` | `EspNowReceiver` | ESP-NOW broadcast, no pairing, any number of listeners |
-| `SerialAndBle` | `BleReceiver` | a Bluetooth notify, which a phone app can read too |
-
-Each sender logs from the loop in flash, a hot function in RAM, and a timer interrupt, and sends a
-struct with `logBin`. `Basic` is Serial only. `Loopback` needs one board and prints both kinds of
-packet byte by byte, as the other board would get them.
+A second argument caps the packet size: `LogOutput air(airSend, 250)` for ESP-NOW. Eight outputs at
+most. For Bluetooth, raise the MTU (`BLEDevice::setMTU(517)`): at the default a packet arrives in
+20 byte pieces, and `logFrom` ignores them.
 
 ## Send structs instead of text
 
-For data you send often, such as telemetry, send the struct itself. Nothing is formatted, and it is
-smaller on the air.
+For telemetry, send the struct itself. Nothing is formatted, and it is smaller.
 
 ```cpp
 struct Sample { uint32_t ms; int16_t rpm, amps; };  // in a header both boards include
 
-logBin(Sample{millis(), rpm, amps});                // on the sender, from anywhere logI works
+logBin(Sample{millis(), rpm, amps});  // sender
+
+logFrom(data, n);                     // receiver, where packets arrive
+static Sample s;
+if (logBinRead(s)) show(s);           // true when a newer one came
 ```
 
-On the receiving board, pass every packet to `logFrom`, the mirror of an output. Then read the struct
-anywhere:
+Any plain struct up to 508 bytes. Both boards match it by its name and size, so there is nothing to
+number.
 
-```cpp
-logFrom(data, n);            // in the callback your packets arrive in: lines go out, structs are kept
+## Examples
 
-static Sample s;             // holds the newest
-if (logBinRead(s)) gauge(s); // true when a newer one came; s is left alone otherwise
-```
+| example | what |
+|---|---|
+| `Basic` | Serial only, from a loop and a pin interrupt. ESP32 or nRF52 |
+| `Loopback` | one board, shows both kinds of packet byte by byte |
+| `SerialAndBle` + `BleReceiver` | two ESP32s over a Bluetooth notify |
+| `SerialAndEspNow` + `EspNowReceiver` | two ESP32s over ESP-NOW, no pairing |
 
-- `logBinRead` gives the newest, like reading a pin: right for state such as a pedal or a gauge.
-  To keep every struct, a log or a graph, read the packets in `logFrom`'s place instead.
-- It never waits, takes no lock and masks no interrupt, so it is safe on your busy core: 0.1 us,
-  0.6 at worst, measured every pass of a SimpleFOC loop in IRAM on an ESP32-S3.
-- Call `logFrom` from one place only.
-- Cap the output at what one write really carries. A Bluetooth link left at the default MTU carries
-  20 bytes: a bigger packet arrives in pieces, and `logFrom` ignores them.
-- Any plain struct up to 508 bytes. Declare it once, in a header both boards share.
-- You never number it. Its id comes from its name and size, so both boards agree on their own, and
-  a changed struct gets a new id that an old receiver ignores instead of misreading.
-- Structs reach your send function with `text` false, as a 4 byte id and then the structs.
-  `logSerial` skips them. `logBin(ble, s)` sends one to the outputs you name.
-- `LOG_LEVEL` does not remove them: they are data, not messages.
-
-Measured with a 32 byte packet of 16 fields, 1000 a second, against the same data as a `logI` line:
-
-| | `logI` line | `logBin` |
-|---|---|---|
-| the call, ESP32-S3 in RAM | 0.7 us | **0.7 us** |
-| the call, ESP32-S3 in flash, worst | 19 us | **9 us** |
-| the call, nRF52840 | 4.9 us | **2.4 us** |
-| the background task, per packet | about 430 us | **19 to 65 us** |
-| bytes on the air | 77 | **32** |
-
-Use `logI` for messages people read, `logBin` for data a program reads.
-
-To read structs in an app that is not C++, work the id out from the struct's name and size:
-
-```js
-function logBinId(name, size) {  // matches the packet's first 4 bytes, little endian
-  let h = 0x811c9dc5;
-  for (const b of [...new TextEncoder().encode(name), size & 255, (size >> 8) & 255])
-    h = Math.imul(h ^ b, 0x01000193) >>> 0;
-  return (h & 255) === 0x5b ? h ^ 1 : h;  // never starts with '[', which starts every line
-}
-```
-
-The name is as C++ spells it: `Sample`, or `ns::Sample` inside a namespace. Over a cable, which has
-no packet edges, send each packet's length first. Structs are not hidden from anyone with the app:
-pair Bluetooth with encryption if that matters.
+`uv run python/programmer.py` flashes an example and opens a serial monitor, or watches
+`SerialAndBle` over Bluetooth.
 
 ## Limits
 
-- The format must be a string literal. The compiler checks it against the arguments.
-- A `%s` string is copied at the call, so its buffer can change right after. Its cost grows with its
-  length, and past 500 bytes it is cut.
-- If the buffer is full, the line is dropped and counted in `logDrops`. A call never waits.
-- A line longer than a packet loses its end.
-- Lines stay in order within a core, not across the two cores.
-- On the ESP32, not from an interrupt above level 3 or the NMI, the same rule as FreeRTOS.
+- The format must be a string literal.
+- A full buffer drops the line and counts it in `logDrops`. A call never waits.
+- Lines keep their order within a core, not across both.
+- `%s` strings past 500 bytes are cut.
 
 ## Settings
 
-`LOG_LEVEL` is a `#define` before the include. The others are build flags: in arduino-cli
-`--build-property "compiler.cpp.extra_flags=-DLOG_RING=8192"`, in PlatformIO `build_flags`.
+Build flags, for example `--build-property "compiler.cpp.extra_flags=-DLOG_RING=8192"`.
 
 | flag | default | what |
 |---|---|---|
-| `LOG_LEVEL` | 5 | 1 error, 2 warn, 3 info, 4 debug, 5 verbose |
-| `LOG_RING` | 4096 | buffer bytes per core, about 170 short lines |
-| `LOG_BODY` | 500 | the longest `%s` kept |
-| `LOG_DRAIN_MS` | 25 | how often the background task empties the buffers |
-| `LOG_BATCH` | 512 | the largest packet |
-| `LOG_CORE` | 0 | ESP32: the core the background task runs on. Keep it off your busy one |
-| `LOG_PRIO` | 1 | the background task's priority |
-| `LOG_STACK` | 4096 | its stack, bytes on the ESP32, words on the nRF52 |
-
-## How it works
-
-Each core has its own buffer. A call pauses its own core's interrupts for the few stores it takes,
-so tasks and interrupts on one core never collide, and the two cores never wait for each other.
-The background task wakes every 25 ms, formats what is waiting, and hands it to the outputs.
+| `LOG_LEVEL` | 5 | 1 error ... 5 verbose. A `#define`, not a flag |
+| `LOG_RING` | 4096 | buffer bytes per core |
+| `LOG_DRAIN_MS` | 25 | how often lines are printed |
+| `LOG_BATCH` | 512 | largest packet |
+| `LOG_CORE` | 0 | ESP32: the background task's core |
+| `LOG_PRIO` | 1 | its priority |
+| `LOG_STACK` | 4096 | its stack |
 
 ## Boards
 
