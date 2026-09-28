@@ -43,8 +43,14 @@ Measured while a motor drive and Bluetooth ran.
    `setup()` is core 1. The examples all do it this way:
 
 ```cpp
-void core0Task(void *) { Serial.begin(115200); vTaskDelete(nullptr); }
-void core1Task(void *) { for (;;) motorLoop(); }
+static void core0Task(void *) {
+  Serial.begin(115200);
+  vTaskDelete(nullptr);
+}
+
+static void core1Task(void *) {
+  for (;;) motorLoop();
+}
 
 void setup() {
   xTaskCreatePinnedToCore(core0Task, "core0Task", 8192, nullptr, 1, nullptr, 0);
